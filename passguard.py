@@ -5,13 +5,28 @@ Runs entirely on your own machine. The password is never printed or saved.
 """
 
 import getpass
+import math
+import re
 import string
 from pathlib import Path
 
-COMMON_PASSWORDS_FILE = Path(__file__).parent / "common_passwords.txt"
+COMMON_FILE = Path(__file__).parent / "common.txt"
 MIN_LENGTH = 8
 MAX_SCORE = 7
+PATTERN_PENALTY = 2          # points removed for each kind of pattern found
+MIN_SEQUENCE = 4             # shortest keyboard run that counts, e.g. "1234"
+MIN_WORD = 4                 # shortest common word that counts
+GUESSES_PER_SECOND = 10_000_000_000   # a fast offline attack
 
+# Runs of MIN_SEQUENCE characters from these count anywhere.
+ORDERED_ROWS = ["1234567890", "abcdefghijklmnopqrstuvwxyz"]
+# Letter rows need one more character, because ordinary words contain short
+# pieces of them ("property" contains "erty"). The start of a row, such as
+# "qwer" or "asdf", still counts at MIN_SEQUENCE.
+LETTER_ROWS = ["qwertyuiop", "asdfghjkl", "zxcvbnm"]
+
+
+# ---------------------------------------------------------------- week 1 rules
 
 def check_length(pw):
     """Return 0-3 points depending on how long the password is."""
@@ -40,17 +55,10 @@ def check_symbols(pw):
     return 1 if any(c in string.punctuation for c in pw) else 0
 
 
-def load_common_passwords(path=COMMON_PASSWORDS_FILE):
-    """Load the common-password list (one per line). Missing file -> empty set."""
-    try:
-        with open(path, encoding="utf-8") as f:
-            return {line.strip().lower() for line in f if line.strip()}
-    except FileNotFoundError:
-        return set()
-
-
-def is_common(pw, common):
-    return pw.lower() in common
+def base_score(pw):
+    """Week 1 score (0-7): length plus one point per character type."""
+    return (check_length(pw) + check_lowercase(pw) + check_uppercase(pw)
+            + check_digits(pw) + check_symbols(pw))
 
 
 def rate(score):
@@ -62,44 +70,214 @@ def rate(score):
     return "Weak"
 
 
-def evaluate(pw, common=None):
-    """Return (score, rating, tips) for a password."""
-    if common is None:
-        common = load_common_passwords()
+# --------------------------------------------------------------------- entropy
 
+def pool_size(pw):
+    """Size of the character set the password appears to be drawn from."""
+    size = 0
+    if any(c.islower() for c in pw):
+        size += 26
+    if any(c.isupper() for c in pw):
+        size += 26
+    if any(c.isdigit() for c in pw):
+        size += 10
+    if any(c in string.punctuation for c in pw):
+        size += len(string.punctuation)
+    if any(not c.isalnum() and c not in string.punctuation for c in pw):
+        size += 1   # spaces and other characters
+    if any(c.isalpha() and not c.isascii() for c in pw):
+        size += 26  # non-English letters
+    return size
+
+
+def estimate_entropy(pw):
+    """Estimated entropy in bits: length * log2(pool_size)."""
+    size = pool_size(pw)
+    if size == 0:
+        return 0.0
+    return len(pw) * math.log2(size)
+
+
+def seconds_to_guess(entropy_bits, guesses_per_second=GUESSES_PER_SECOND):
+    """Average time to guess: half of all combinations at the given speed."""
+    return 2 ** entropy_bits / 2 / guesses_per_second
+
+
+def describe_time(seconds):
+    """Turn a number of seconds into plain English."""
+    if seconds < 1:
+        return "less than a second"
+    units = [("minute", 60), ("hour", 3600), ("day", 86400),
+             ("month", 86400 * 30), ("year", 86400 * 365)]
+    name, size = "second", 1
+    for unit_name, unit_size in units:
+        if seconds >= unit_size:
+            name, size = unit_name, unit_size
+    amount = seconds / size
+    if name == "year":
+        if amount >= 1e9:
+            return "more than a billion years"
+        if amount >= 1e6:
+            return f"about {round(amount / 1e6)} million years"
+        if amount >= 1e3:
+            return f"about {round(amount / 1e3)} thousand years"
+    amount = round(amount)
+    return f"about {amount} {name}{'s' if amount != 1 else ''}"
+
+
+# -------------------------------------------------------------------- patterns
+
+def load_common(path=COMMON_FILE):
+    """Load the common-password list (one per line). Missing file -> empty set."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            return {line.strip().lower() for line in f if line.strip()}
+    except FileNotFoundError:
+        return set()
+
+
+def is_common(pw, common):
+    """True if the whole password is on the common list."""
+    return pw.lower() in common
+
+
+def has_common_word(pw, common):
+    """True if a common word such as 'password' appears inside the password."""
+    lowered = pw.lower()
+    words = (w for w in common if w.isalpha() and len(w) >= MIN_WORD)
+    return any(word in lowered for word in words)
+
+
+def has_keyboard_sequence(pw, min_run=MIN_SEQUENCE):
+    """True for runs like 'qwer', '1234' or 'dcba' (forwards or backwards)."""
+    lowered = pw.lower()
+    if any(_contains_run(lowered, row, min_run) for row in ORDERED_ROWS):
+        return True
+    for row in LETTER_ROWS:
+        if row[:min_run] in lowered or row[:min_run][::-1] in lowered:
+            return True
+        if _contains_run(lowered, row, min_run + 1):
+            return True
+    return False
+
+
+def _contains_run(text, row, run):
+    """True if text contains `run` neighbouring characters of row, either direction."""
+    for direction in (row, row[::-1]):
+        for i in range(len(direction) - run + 1):
+            if direction[i:i + run] in text:
+                return True
+    return False
+
+
+def has_repeated_chars(pw):
+    """True if the same character appears three or more times in a row."""
+    return re.search(r"(.)\1{2,}", pw) is not None
+
+
+def has_year(pw):
+    """True if the password contains a year from 1900 to 2099."""
+    return re.search(r"(?<!\d)(19|20)\d{2}(?!\d)", pw) is not None
+
+
+def find_patterns(pw, common):
+    """Return a list of (name, tip) for every predictable pattern found."""
+    found = []
+    if has_common_word(pw, common):
+        found.append(("common word", "Avoid common words - use something unpredictable"))
+    if has_keyboard_sequence(pw):
+        found.append(("keyboard sequence", "Avoid keyboard sequences like qwerty or 1234"))
+    if has_repeated_chars(pw):
+        found.append(("repeated characters", "Avoid repeating the same character"))
+    if has_year(pw):
+        found.append(("year", "Avoid years such as a birth year or the current year"))
+    return found
+
+
+# ------------------------------------------------------------------ evaluation
+
+def rule_tips(pw):
+    """Tips for the week 1 rules the password does not meet."""
     tips = []
-
     length_score = check_length(pw)
     if length_score == 0:
         tips.append(f"Use at least {MIN_LENGTH} characters (12 or more is better)")
     elif length_score < 3:
         tips.append("Make it longer - 16 or more characters gets the full length score")
+    if not check_lowercase(pw):
+        tips.append("Add at least one lowercase letter")
+    if not check_uppercase(pw):
+        tips.append("Add at least one uppercase letter")
+    if not check_digits(pw):
+        tips.append("Add at least one digit")
+    if not check_symbols(pw):
+        tips.append("Add at least one symbol (e.g. ! @ # $ %)")
+    return tips
 
-    checks = [
-        (check_lowercase, "Add at least one lowercase letter"),
-        (check_uppercase, "Add at least one uppercase letter"),
-        (check_digits, "Add at least one digit"),
-        (check_symbols, "Add at least one symbol (e.g. ! @ # $ %)"),
-    ]
-    score = length_score
-    for check, tip in checks:
-        points = check(pw)
-        score += points
-        if points == 0:
-            tips.append(tip)
 
+def evaluate(pw, common=None):
+    """Return a dict describing the password. The password itself is not included."""
+    if common is None:
+        common = load_common()
+
+    base = base_score(pw)
+    patterns = find_patterns(pw, common)
+    score = max(0, base - PATTERN_PENALTY * len(patterns))
     rating = rate(score)
+    tips = [tip for _, tip in patterns] + rule_tips(pw)
 
     # A short password is weak no matter how many character types it has.
-    if length_score == 0:
+    if check_length(pw) == 0:
         rating = "Weak"
 
-    # Stretch goal: a known common password is weak immediately.
-    if is_common(pw, common):
+    # A known common password is weak immediately.
+    common_password = is_common(pw, common)
+    if common_password:
         rating = "Weak"
         tips.insert(0, "This is one of the most common passwords - choose something unique")
 
-    return score, rating, tips
+    entropy = estimate_entropy(pw)
+    if common_password:
+        time_to_guess = "instantly (it is on common password lists)"
+    else:
+        time_to_guess = describe_time(seconds_to_guess(entropy))
+
+    return {
+        "score": score,
+        "base_score": base,
+        "rating": rating,
+        "entropy_bits": entropy,
+        "time_to_guess": time_to_guess,
+        "common_password": common_password,
+        "patterns": [name for name, _ in patterns],
+        "tips": tips,
+    }
+
+
+def print_report(result):
+    score_line = f"Score:   {result['score']}/{MAX_SCORE}"
+    if result["score"] != result["base_score"]:
+        score_line += f" ({result['base_score']} before pattern penalties)"
+    print(f"\n{score_line}")
+    print(f"Rating:  {result['rating']}")
+    print(f"Entropy: about {result['entropy_bits']:.1f} bits (estimate)")
+    print(f"Time to guess: {result['time_to_guess']}")
+    if not result["common_password"]:
+        print(f"  at {GUESSES_PER_SECOND:,} guesses per second, trying every combination")
+        if result["patterns"]:
+            print("  patterns were found, so a real attacker would be much faster")
+
+    if result["patterns"]:
+        print("\nPatterns found:")
+        for name in result["patterns"]:
+            print(f"  - {name}")
+
+    if result["tips"]:
+        print("\nTips:")
+        for tip in result["tips"]:
+            print(f"  - {tip}")
+    else:
+        print("\nNo tips - this password passes every rule.")
 
 
 def main():
@@ -111,17 +289,7 @@ def main():
         print("No password entered.")
         return
 
-    score, rating, tips = evaluate(pw)
-
-    print(f"\nScore:  {score}/{MAX_SCORE}")
-    print(f"Rating: {rating}")
-
-    if tips:
-        print("\nTips:")
-        for tip in tips:
-            print(f"  - {tip}")
-    else:
-        print("\nNo tips - this password passes every rule.")
+    print_report(evaluate(pw))
 
 
 if __name__ == "__main__":
