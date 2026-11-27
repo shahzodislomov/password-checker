@@ -5,10 +5,13 @@ Runs entirely on your own machine. The password is never printed or saved.
 """
 
 import getpass
+import hashlib
 import math
 import re
 import string
 from pathlib import Path
+
+import requests
 
 COMMON_FILE = Path(__file__).parent / "common.txt"
 MIN_LENGTH = 8
@@ -17,6 +20,9 @@ PATTERN_PENALTY = 2          # points removed for each kind of pattern found
 MIN_SEQUENCE = 4             # shortest keyboard run that counts, e.g. "1234"
 MIN_WORD = 4                 # shortest common word that counts
 GUESSES_PER_SECOND = 10_000_000_000   # a fast offline attack
+
+PWNED_API_URL = "https://api.pwnedpasswords.com/range/{prefix}"
+PWNED_TIMEOUT = 5
 
 # Runs of MIN_SEQUENCE characters from these count anywhere.
 ORDERED_ROWS = ["1234567890", "abcdefghijklmnopqrstuvwxyz"]
@@ -194,6 +200,82 @@ def find_patterns(pw, common):
     return found
 
 
+# ----------------------------------------------- breach check (k-anonymity)
+
+_PREFIX_CACHE = {}
+
+
+def pwned_hash(pw):
+    """Return (prefix, suffix) of SHA-1 hash for k-anonymity.
+
+    The first 5 characters (prefix) are sent to the API.
+    The remaining 35 characters (suffix) stay local to search the response.
+    """
+    sha1_hex = hashlib.sha1(pw.encode("utf-8")).hexdigest().upper()
+    return sha1_hex[:5], sha1_hex[5:]
+
+
+def query_pwned_range(prefix, timeout=PWNED_TIMEOUT, cache=None):
+    """Query Have I Been Pwned range API for hash prefix.
+
+    Returns a dict mapping suffix -> breach count.
+    Results are cached to avoid repeated API requests for the same prefix.
+    """
+    prefix = prefix.upper()
+    target_cache = _PREFIX_CACHE if cache is None else cache
+    if prefix in target_cache:
+        return target_cache[prefix]
+
+    url = PWNED_API_URL.format(prefix=prefix)
+    headers = {"User-Agent": "PassGuard-Breach-Checker"}
+    response = requests.get(url, timeout=timeout, headers=headers)
+    response.raise_for_status()
+
+    hashes = {}
+    for line in response.text.splitlines():
+        line = line.strip()
+        if ":" in line:
+            suffix, count_str = line.split(":", 1)
+            try:
+                hashes[suffix.upper()] = int(count_str.strip())
+            except ValueError:
+                continue
+
+    target_cache[prefix] = hashes
+    return hashes
+
+
+def check_breach(pw, timeout=PWNED_TIMEOUT, cache=None):
+    """Check Have I Been Pwned for breaches using k-anonymity.
+
+    Returns a dict with:
+      - status: "ok" or "error"
+      - breached: bool (True if breach count > 0)
+      - count: int (number of times seen in breaches, or 0)
+      - prefix: str (the 5-char prefix checked)
+      - error: str or None (user-friendly error message if failed)
+    """
+    prefix, suffix = pwned_hash(pw)
+    try:
+        prefix_data = query_pwned_range(prefix, timeout=timeout, cache=cache)
+        count = prefix_data.get(suffix, 0)
+        return {
+            "status": "ok",
+            "breached": count > 0,
+            "count": count,
+            "prefix": prefix,
+            "error": None,
+        }
+    except requests.RequestException:
+        return {
+            "status": "error",
+            "breached": False,
+            "count": 0,
+            "prefix": prefix,
+            "error": "offline or network error (could not verify breach status)",
+        }
+
+
 # ------------------------------------------------------------------ evaluation
 
 def rule_tips(pw):
@@ -215,7 +297,7 @@ def rule_tips(pw):
     return tips
 
 
-def evaluate(pw, common=None):
+def evaluate(pw, common=None, check_pwned=True, pwned_cache=None, timeout=PWNED_TIMEOUT):
     """Return a dict describing the password. The password itself is not included."""
     if common is None:
         common = load_common()
@@ -236,6 +318,13 @@ def evaluate(pw, common=None):
         rating = "Weak"
         tips.insert(0, "This is one of the most common passwords - choose something unique")
 
+    breach_info = None
+    if check_pwned:
+        breach_info = check_breach(pw, timeout=timeout, cache=pwned_cache)
+        if breach_info["status"] == "ok" and breach_info["breached"]:
+            rating = "Weak"
+            tips.insert(0, f"Found in {breach_info['count']:,} known data breaches - do not use this password")
+
     entropy = estimate_entropy(pw)
     if common_password:
         time_to_guess = "instantly (it is on common password lists)"
@@ -251,6 +340,7 @@ def evaluate(pw, common=None):
         "common_password": common_password,
         "patterns": [name for name, _ in patterns],
         "tips": tips,
+        "breach": breach_info,
     }
 
 
@@ -266,6 +356,16 @@ def print_report(result):
         print(f"  at {GUESSES_PER_SECOND:,} guesses per second, trying every combination")
         if result["patterns"]:
             print("  patterns were found, so a real attacker would be much faster")
+
+    if result.get("breach"):
+        breach = result["breach"]
+        if breach["status"] == "ok":
+            if breach["breached"]:
+                print(f"Breach:  Found in {breach['count']:,} known data breaches!")
+            else:
+                print("Breach:  Safe (no matches found in known data breaches)")
+        else:
+            print(f"Breach:  Check unavailable ({breach['error']})")
 
     if result["patterns"]:
         print("\nPatterns found:")
